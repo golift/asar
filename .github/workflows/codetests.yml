@@ -3,6 +3,7 @@ on:
   pull_request:
     branches:
     - main
+    - add-asar-reader
 permissions:
   contents: read
 jobs:
@@ -19,6 +20,26 @@ jobs:
           go-version: stable
       - name: go-test
         run: 	go test -race -covermode=atomic '-test.v' ./...
+  # Packs archives with the Electron asar CLI and reads them back.
+  electron:
+    strategy:
+      matrix:
+        os: [macos, windows, ubuntu]
+    runs-on: ${{ matrix.os }}-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: stable
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: integration/package-lock.json
+      - name: npm-ci
+        run: npm ci --prefix integration
+      - name: go-test-integration
+        run: go test -race -count=1 -tags integration -run 'TestElectron' ./...
   # Runs golangci-lint on macos against freebsd and macos.
   golangci-darwin:
     strategy:
