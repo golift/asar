@@ -15,6 +15,13 @@ integrity hashes.
 Unpacked entries (`unpacked: true`) live in a sibling `{archive}.unpacked` directory.
 The reader records the flag; callers copy those files themselves.
 
+Integration tests pack archives with `@electron/asar` 4.3.0 and read them back:
+
+```sh
+npm ci --prefix integration
+go test -tags integration -race ./...
+```
+
 ```go
 package main
 

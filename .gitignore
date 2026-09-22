@@ -1,3 +1,4 @@
 *~
 *.DS*
 coverage.out
+integration/node_modules
