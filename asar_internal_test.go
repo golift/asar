@@ -110,20 +110,39 @@ func TestSymlinkAndExecutable(t *testing.T) {
 func TestUnpackedEntry(t *testing.T) {
 	t.Parallel()
 
-	archive := makeArchive(t, filesHeader(map[string]any{
-		"native.node": map[string]any{"unpacked": true, "size": 10},
-	}))
-
-	reader := mustReader(t, archive)
-	native := fileByName(t, reader, "native.node")
-
-	if !native.Unpacked || native.Size != 10 || native.Packed() {
-		t.Fatalf("unpacked entry = %+v", native)
+	tests := []struct {
+		name  string
+		entry map[string]any
+		blobs [][]byte
+	}{
+		{
+			name:  "size only",
+			entry: map[string]any{"unpacked": true, "size": 10},
+		},
+		{
+			name:  "offset and unpacked",
+			entry: packed("0", 4, map[string]any{"unpacked": true}),
+			blobs: [][]byte{[]byte("nope")},
+		},
 	}
 
-	_, err := native.Open()
-	if !errors.Is(err, ErrNotPacked) {
-		t.Fatalf("Open(unpacked) = %v", err)
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			archive := makeArchive(t, filesHeader(map[string]any{"native.node": test.entry}), test.blobs...)
+			reader := mustReader(t, archive)
+			native := fileByName(t, reader, "native.node")
+
+			if !native.Unpacked || native.Packed() {
+				t.Fatalf("unpacked entry = %+v packed=%v", native, native.Packed())
+			}
+
+			_, err := native.Open()
+			if !errors.Is(err, ErrNotPacked) {
+				t.Fatalf("Open(unpacked) = %v", err)
+			}
+		})
 	}
 }
 

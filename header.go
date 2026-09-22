@@ -103,24 +103,31 @@ func nodeToFile(path string, node *jsonNode, dataOffset, archiveSize int64) (*Fi
 		return &File{Name: path, Link: node.Link, Unpacked: boolVal(node.Unpacked)}, nil, nil
 	case node.Files != nil:
 		return &File{Name: path, Unpacked: boolVal(node.Unpacked), dir: true}, node.Files, nil
+	case boolVal(node.Unpacked) && node.Size != nil:
+		// Electron validates offset-bearing entries first, then honors unpacked
+		// at read time. Treat unpacked before offset so Open does not return
+		// archive bytes for a sibling that lives in {archive}.unpacked.
+		return unpackedFile(path, node)
 	case node.Offset != "":
 		return packedFile(path, node, dataOffset, archiveSize)
-	case boolVal(node.Unpacked) && node.Size != nil:
-		size, err := parseSize(path, *node.Size)
-		if err != nil {
-			return nil, nil, err
-		}
-
-		return &File{
-			Name:       path,
-			Size:       size,
-			Unpacked:   true,
-			Executable: boolVal(node.Executable),
-			Integrity:  node.Integrity,
-		}, nil, nil
 	default:
 		return nil, nil, fmt.Errorf("%w: entry %q is not a directory, file, or link", ErrInvalidHeader, path)
 	}
+}
+
+func unpackedFile(path string, node *jsonNode) (*File, map[string]json.RawMessage, error) {
+	size, err := parseSize(path, *node.Size)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	return &File{
+		Name:       path,
+		Size:       size,
+		Unpacked:   true,
+		Executable: boolVal(node.Executable),
+		Integrity:  node.Integrity,
+	}, nil, nil
 }
 
 func packedFile(path string, node *jsonNode, dataOffset, archiveSize int64) (*File, map[string]json.RawMessage, error) {
