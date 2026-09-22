@@ -1,10 +1,10 @@
-// Package asar reads Electron ASAR archives.
+// Package asar reads and writes Electron ASAR archives.
 //
 // An ASAR file is an 8-byte size pickle, a JSON index pickle, and concatenated
 // uncompressed file bytes. Offsets in the index are relative to the start of those
 // bytes. Files with identical contents may share one offset. Entries marked unpacked
-// live in a sibling directory named {archive}.unpacked; this package only records
-// that flag. Integrity hashes are parsed and not verified.
+// live in a sibling directory named {archive}.unpacked. Integrity hashes are
+// stored by the writer and parsed, not verified, by the reader.
 package asar
 
 import (
