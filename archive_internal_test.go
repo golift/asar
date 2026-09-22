@@ -36,8 +36,17 @@ func makeArchive(t *testing.T, header map[string]any, blobs ...[]byte) []byte {
 		t.Fatal(err)
 	}
 
-	headerPickle := pickleString(string(raw))
-	out := bytes.NewBuffer(pickleUInt32(uint32(len(headerPickle))))
+	headerPickle, err := encodeStringPickle(string(raw))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	sizePickle, err := encodeSizePickle(len(headerPickle))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	out := bytes.NewBuffer(sizePickle)
 	_, _ = out.Write(headerPickle)
 
 	for _, blob := range blobs {

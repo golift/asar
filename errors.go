@@ -2,7 +2,7 @@ package asar
 
 import "errors"
 
-// Package-level errors returned while reading an ASAR archive.
+// Package-level errors returned while reading or writing an ASAR archive.
 var (
 	// ErrInvalidHeader is returned when the pickle header or JSON index is malformed.
 	ErrInvalidHeader = errors.New("invalid asar header")
@@ -12,4 +12,8 @@ var (
 	ErrNotPacked = errors.New("asar entry is not packed file data")
 	// ErrHeaderTooLarge is returned when the header pickle exceeds maxHeaderPickle.
 	ErrHeaderTooLarge = errors.New("asar header exceeds maximum size")
+	// ErrLinkOutside is returned when a symlink target leaves the archive root.
+	ErrLinkOutside = errors.New("asar symlink points outside the archive")
+	// ErrFileTooLarge is returned when a file is larger than an ASAR entry allows.
+	ErrFileTooLarge = errors.New("asar file exceeds maximum size")
 )
