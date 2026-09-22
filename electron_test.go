@@ -334,9 +334,16 @@ func compareTreePath(t *testing.T, left, right, path string) {
 		t.Fatal(err)
 	}
 
-	otherInfo, err := os.Lstat(filepath.Join(right, rel))
+	other := filepath.Join(right, rel)
+
+	otherInfo, err := os.Lstat(other)
 	if err != nil {
 		t.Errorf("missing %s: %v", rel, err)
+		return
+	}
+
+	if windowsLinkFile(info, otherInfo) {
+		compareFile(t, path, other, rel, info, otherInfo)
 		return
 	}
 
@@ -346,7 +353,7 @@ func compareTreePath(t *testing.T, left, right, path string) {
 	}
 
 	if info.Mode()&os.ModeSymlink != 0 {
-		compareLink(t, path, filepath.Join(right, rel), rel)
+		compareLink(t, path, other, rel)
 		return
 	}
 
@@ -354,7 +361,20 @@ func compareTreePath(t *testing.T, left, right, path string) {
 		return
 	}
 
-	compareFile(t, path, filepath.Join(right, rel), rel, info, otherInfo)
+	compareFile(t, path, other, rel, info, otherInfo)
+}
+
+// windowsLinkFile reports Electron's Windows extract behavior: extractAll follows
+// links and writes the target bytes as a regular file.
+func windowsLinkFile(left, right os.FileInfo) bool {
+	if runtime.GOOS != "windows" {
+		return false
+	}
+
+	leftLink := left.Mode()&os.ModeSymlink != 0
+	rightLink := right.Mode()&os.ModeSymlink != 0
+
+	return leftLink != rightLink
 }
 
 func compareLink(t *testing.T, left, right, rel string) {
