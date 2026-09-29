@@ -1,4 +1,7 @@
 version: '2'
+run:
+  build-tags:
+    - integration
 linters:
   default: all
   disable:
@@ -22,6 +25,9 @@ linters:
           - err113
           - errchkjson
         path: .+_test.go
+      - linters:
+          - gosec
+        path: electron_test.go
   settings:
     gosec:
       excludes:

@@ -1,0 +1,8 @@
+{
+  "name": "asar-integration",
+  "private": true,
+  "description": "Pinned Electron ASAR CLI used by go test -tags integration.",
+  "dependencies": {
+    "@electron/asar": "4.3.0"
+  }
+}
