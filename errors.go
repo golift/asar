@@ -14,6 +14,8 @@ var (
 	ErrHeaderTooLarge = errors.New("asar header exceeds maximum size")
 	// ErrLinkOutside is returned when a symlink target leaves the archive root.
 	ErrLinkOutside = errors.New("asar symlink points outside the archive")
-	// ErrFileTooLarge is returned when a file is larger than an ASAR entry allows.
+	// ErrFileTooLarge is returned when a packed file is larger than an ASAR entry allows.
 	ErrFileTooLarge = errors.New("asar file exceeds maximum size")
+	// ErrOutputInside is returned when the archive path is inside the source tree.
+	ErrOutputInside = errors.New("asar output is inside the source tree")
 )

@@ -5,18 +5,23 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 )
 
 const (
 	integrityBlockSize = 4 << 20
-	maxEntrySize       = int64(1<<32 - 1) // Electron rejects a single file above uint32.
+	maxEntrySize       = int64(1<<32 - 1) // Electron rejects a packed file above uint32.
+	archiveFileMode    = 0o644
+	executableMode     = 0o755
+	executablePerm     = 0o111
 	archiveDirMode     = 0o750
 )
 
@@ -64,14 +69,21 @@ func WriteArchive(writer io.Writer, entries []Entry) error {
 // Pack writes the directory src to dest as an ASAR archive.
 // Symlinks become package-relative links and must stay inside src.
 // Unpacked files are copied to dest+".unpacked".
-func Pack(dest, src string, opts Options) (err error) {
-	info, err := os.Lstat(src)
+// dest must not be inside src. A previous archive is replaced only after the
+// new archive and sibling tree have both been written.
+func Pack(dest, src string, opts Options) error {
+	info, err := os.Stat(src)
 	if err != nil {
 		return fmt.Errorf("pack asar: %w", err)
 	}
 
 	if !info.IsDir() {
 		return fmt.Errorf("%w: %s is not a directory", ErrInvalidHeader, src)
+	}
+
+	err = rejectOutputInsideSource(dest, src)
+	if err != nil {
+		return err
 	}
 
 	builder := newBuilder(opts)
@@ -81,15 +93,7 @@ func Pack(dest, src string, opts Options) (err error) {
 		return err
 	}
 
-	err = builder.writePacked(dest)
-	if err != nil {
-		_ = os.Remove(dest)
-		_ = os.RemoveAll(dest + ".unpacked")
-
-		return err
-	}
-
-	return nil
+	return builder.publish(dest)
 }
 
 type bodySource struct {
@@ -128,6 +132,7 @@ type unpackedLink struct {
 
 type siblingFile struct {
 	name   string
+	mode   os.FileMode
 	source bodySource
 }
 
@@ -154,7 +159,7 @@ func (b *builder) addEntry(entry Entry) error {
 	case entry.Dir:
 		return b.addDir(entry.Name, entry.Unpacked)
 	default:
-		return b.addContent(entry.Name, bodySource{data: entry.Data}, entry.Executable, entry.Unpacked)
+		return b.addContent(entry.Name, bodySource{data: entry.Data}, entryMode(entry.Executable), entry.Unpacked)
 	}
 }
 
@@ -184,7 +189,7 @@ func (b *builder) addTree(root string) error {
 		case info.IsDir():
 			return b.addDir(name, b.wantUnpack(name))
 		case info.Mode().IsRegular():
-			return b.addContent(name, bodySource{path: diskPath}, info.Mode()&0o111 != 0, b.wantUnpack(name))
+			return b.addContent(name, bodySource{path: diskPath}, info.Mode().Perm(), b.wantUnpack(name))
 		default:
 			return fmt.Errorf("%w: %s is not a regular file", ErrInvalidHeader, name)
 		}
@@ -272,13 +277,13 @@ func (b *builder) addLink(name, rel, raw string, unpacked bool) error {
 	return nil
 }
 
-func (b *builder) addContent(name string, source bodySource, executable, unpacked bool) error {
+func (b *builder) addContent(name string, source bodySource, mode os.FileMode, unpacked bool) error {
 	sum, size, err := source.integrity()
 	if err != nil {
 		return err
 	}
 
-	if size > maxEntrySize {
+	if !unpacked && size > maxEntrySize {
 		return fmt.Errorf("%w: %s is %d bytes", ErrFileTooLarge, name, size)
 	}
 
@@ -288,12 +293,12 @@ func (b *builder) addContent(name string, source bodySource, executable, unpacke
 	}
 
 	node.size = size
-	node.executable = executable
+	node.executable = mode&executablePerm != 0
 	node.integrity = sum
 	node.unpacked = unpacked
 
 	if unpacked {
-		b.siblings = append(b.siblings, siblingFile{name: name, source: source})
+		b.siblings = append(b.siblings, siblingFile{name: name, mode: siblingMode(mode), source: source})
 		return nil
 	}
 
@@ -391,29 +396,97 @@ func (b *builder) wantUnpack(name string) bool {
 	return false
 }
 
-func (b *builder) writePacked(dest string) error {
-	err := os.MkdirAll(filepath.Dir(dest), archiveDirMode)
+func (b *builder) publish(dest string) error {
+	dir := filepath.Dir(dest)
+	if dir == "" {
+		dir = "."
+	}
+
+	err := os.MkdirAll(dir, archiveDirMode)
 	if err != nil {
 		return fmt.Errorf("pack asar: %w", err)
 	}
 
-	out, err := os.Create(dest)
-	if err != nil {
-		return fmt.Errorf("pack asar: %w", err)
-	}
-
-	err = b.writeTo(out)
-	closeErr := out.Close()
-
+	archiveName, err := b.stageArchive(dir)
 	if err != nil {
 		return err
 	}
 
-	if closeErr != nil {
-		return fmt.Errorf("pack asar: %w", closeErr)
+	unpackedName, err := b.stageUnpacked(dir)
+	if err != nil {
+		_ = os.Remove(archiveName)
+		return err
 	}
 
-	return b.writeSiblings(dest + ".unpacked")
+	err = installFile(archiveName, dest)
+	if err != nil {
+		_ = os.Remove(archiveName)
+		_ = removeTree(unpackedName)
+
+		return err
+	}
+
+	err = installUnpacked(unpackedName, dest+".unpacked")
+	if err != nil {
+		_ = removeTree(unpackedName)
+		return err
+	}
+
+	return nil
+}
+
+func (b *builder) stageArchive(dir string) (string, error) {
+	out, err := os.CreateTemp(dir, ".asar-*")
+	if err != nil {
+		return "", fmt.Errorf("pack asar: %w", err)
+	}
+
+	name := out.Name()
+	writeErr := b.writeTo(out)
+	closeErr := out.Close()
+
+	if writeErr != nil {
+		_ = os.Remove(name)
+		return "", writeErr
+	}
+
+	if closeErr != nil {
+		_ = os.Remove(name)
+		return "", fmt.Errorf("pack asar: %w", closeErr)
+	}
+
+	err = os.Chmod(name, archiveFileMode)
+	if err != nil {
+		_ = os.Remove(name)
+		return "", fmt.Errorf("pack asar: %w", err)
+	}
+
+	return name, nil
+}
+
+func (b *builder) stageUnpacked(dir string) (string, error) {
+	if len(b.siblings) == 0 && len(b.links) == 0 {
+		return "", nil
+	}
+
+	name, err := os.MkdirTemp(dir, ".asar-unpacked-*")
+	if err != nil {
+		return "", fmt.Errorf("pack asar: %w", err)
+	}
+
+	err = os.Chmod(name, archiveDirMode)
+	if err != nil {
+		_ = os.RemoveAll(name)
+		return "", fmt.Errorf("pack asar: %w", err)
+	}
+
+	err = b.writeSiblings(name)
+	if err != nil {
+		_ = os.RemoveAll(name)
+		return "", err
+	}
+
+	return name, nil
 }
 
 func (b *builder) writeTo(out io.Writer) error {
@@ -432,14 +505,14 @@ func (b *builder) writeTo(out io.Writer) error {
 		return err
 	}
 
-	_, err = out.Write(size)
+	err = writeFull(out, size)
 	if err != nil {
-		return fmt.Errorf("write asar: %w", err)
+		return err
 	}
 
-	_, err = out.Write(header)
+	err = writeFull(out, header)
 	if err != nil {
-		return fmt.Errorf("write asar: %w", err)
+		return err
 	}
 
 	for _, source := range b.body {
@@ -538,12 +611,7 @@ func (s bodySource) integrity() (*Integrity, int64, error) {
 
 func (s bodySource) copyTo(out io.Writer) error {
 	if s.path == "" {
-		_, err := out.Write(s.data)
-		if err != nil {
-			return fmt.Errorf("write asar: %w", err)
-		}
-
-		return nil
+		return writeFull(out, s.data)
 	}
 
 	file, err := os.Open(s.path)
@@ -569,24 +637,28 @@ func (s siblingFile) write(root string) error {
 		}
 		defer file.Close()
 
-		return writeNew(dest, file)
+		return writeNew(dest, file, s.mode)
 	}
 
-	return writeNew(dest, bytes.NewReader(s.source.data))
+	return writeNew(dest, bytes.NewReader(s.source.data), s.mode)
 }
 
-func writeNew(dest string, reader io.Reader) error {
+func writeNew(dest string, reader io.Reader, mode os.FileMode) error {
 	err := os.MkdirAll(filepath.Dir(dest), archiveDirMode)
 	if err != nil {
 		return fmt.Errorf("pack asar: %w", err)
 	}
 
-	out, err := os.Create(dest)
+	out, err := os.OpenFile(dest, os.O_CREATE|os.O_EXCL|os.O_WRONLY, mode)
 	if err != nil {
 		return fmt.Errorf("pack asar: %w", err)
 	}
 
 	_, err = io.Copy(out, reader)
+	if err == nil {
+		err = out.Chmod(mode)
+	}
+
 	closeErr := out.Close()
 
 	if err != nil {
@@ -602,7 +674,6 @@ func writeNew(dest string, reader io.Reader) error {
 
 func integrityReader(input io.Reader) (*Integrity, int64, error) {
 	whole := sha256.New()
-	block := sha256.New()
 	blocks := make([]string, 0, 1)
 	buf := make([]byte, integrityBlockSize)
 
@@ -616,9 +687,7 @@ func integrityReader(input io.Reader) (*Integrity, int64, error) {
 		size += int64(n)
 
 		if filled == integrityBlockSize {
-			blocks = append(blocks, sumBlock(whole, block, buf[:filled]))
-			block.Reset()
-
+			blocks = append(blocks, sumBlock(whole, buf[:filled]))
 			filled = 0
 		}
 
@@ -632,7 +701,7 @@ func integrityReader(input io.Reader) (*Integrity, int64, error) {
 	}
 
 	if filled > 0 || len(blocks) == 0 {
-		blocks = append(blocks, sumBlock(whole, block, buf[:filled]))
+		blocks = append(blocks, sumBlock(whole, buf[:filled]))
 	}
 
 	return &Integrity{
@@ -643,9 +712,8 @@ func integrityReader(input io.Reader) (*Integrity, int64, error) {
 	}, size, nil
 }
 
-func sumBlock(whole, block io.Writer, chunk []byte) string {
+func sumBlock(whole io.Writer, chunk []byte) string {
 	_, _ = whole.Write(chunk)
-	_, _ = block.Write(chunk)
 	sum := sha256.Sum256(chunk)
 
 	return hex.EncodeToString(sum[:])
@@ -666,8 +734,20 @@ func linkInside(root, linkPath, raw string) (string, error) {
 		target = filepath.Join(filepath.Dir(linkPath), target)
 	}
 
-	rel, err := filepath.Rel(filepath.Clean(root), filepath.Clean(target))
-	if err != nil || rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+	rootAbs, err := resolveDir(root)
+	if err != nil {
+		return "", err
+	}
+
+	// Resolve the target the same way as root. On macOS /var is a symlink to
+	// /private/var, so Abs alone makes an in-tree target look outside.
+	targetAbs, err := resolveOutput(target)
+	if err != nil {
+		return "", err
+	}
+
+	rel, err := filepath.Rel(rootAbs, targetAbs)
+	if err != nil || rel == "." || outsideRel(rel) {
 		return "", fmt.Errorf("%w: %s", ErrLinkOutside, raw)
 	}
 
@@ -701,4 +781,202 @@ func cleanLink(link string) (string, error) {
 	}
 
 	return link, nil
+}
+
+func entryMode(executable bool) os.FileMode {
+	if executable {
+		return executableMode
+	}
+
+	return archiveFileMode
+}
+
+func siblingMode(mode os.FileMode) os.FileMode {
+	mode = mode.Perm()
+	if mode == 0 {
+		return archiveFileMode
+	}
+
+	return mode
+}
+
+func writeFull(out io.Writer, data []byte) error {
+	n, err := out.Write(data)
+	if err != nil {
+		return fmt.Errorf("write asar: %w", err)
+	}
+
+	if n != len(data) {
+		return io.ErrShortWrite
+	}
+
+	return nil
+}
+
+func rejectOutputInsideSource(dest, src string) error {
+	root, err := resolveDir(src)
+	if err != nil {
+		return err
+	}
+
+	for _, candidate := range []string{dest, dest + ".unpacked"} {
+		resolved, err := resolveOutput(candidate)
+		if err != nil {
+			return err
+		}
+
+		inside, err := insideDir(root, resolved)
+		if err != nil {
+			return err
+		}
+
+		if inside {
+			return fmt.Errorf("%w: %s", ErrOutputInside, candidate)
+		}
+	}
+
+	return nil
+}
+
+func resolveDir(name string) (string, error) {
+	abs, err := filepath.Abs(name)
+	if err != nil {
+		return "", fmt.Errorf("pack asar: %w", err)
+	}
+
+	resolved, err := filepath.EvalSymlinks(abs)
+	if err != nil {
+		return "", fmt.Errorf("pack asar: %w", err)
+	}
+
+	return resolved, nil
+}
+
+func resolveOutput(name string) (string, error) {
+	abs, err := filepath.Abs(name)
+	if err != nil {
+		return "", fmt.Errorf("pack asar: %w", err)
+	}
+
+	parent, err := resolveExistingPrefix(filepath.Dir(abs))
+	if err != nil {
+		return "", err
+	}
+
+	return filepath.Join(parent, filepath.Base(abs)), nil
+}
+
+func resolveExistingPrefix(name string) (string, error) {
+	current := name
+
+	var pending []string
+
+	for {
+		resolved, err := filepath.EvalSymlinks(current)
+		if err == nil {
+			for _, p := range slices.Backward(pending) {
+				resolved = filepath.Join(resolved, p)
+			}
+
+			return resolved, nil
+		}
+
+		if !errors.Is(err, os.ErrNotExist) {
+			return "", fmt.Errorf("pack asar: %w", err)
+		}
+
+		parent := filepath.Dir(current)
+		if parent == current {
+			return name, nil
+		}
+
+		pending = append(pending, filepath.Base(current))
+		current = parent
+	}
+}
+
+func insideDir(root, candidate string) (bool, error) {
+	rel, err := filepath.Rel(root, candidate)
+	if err != nil {
+		return false, fmt.Errorf("pack asar: %w", err)
+	}
+
+	return rel == "." || !outsideRel(rel), nil
+}
+
+func outsideRel(rel string) bool {
+	return rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator))
+}
+
+func installFile(tmp, dest string) error {
+	return swapPath(tmp, dest, false)
+}
+
+func installUnpacked(tmp, dest string) error {
+	if tmp == "" {
+		return removeTree(dest)
+	}
+
+	return swapPath(tmp, dest, true)
+}
+
+func swapPath(tmp, dest string, tree bool) error {
+	_, err := os.Lstat(dest)
+	if errors.Is(err, os.ErrNotExist) {
+		return renamePath(tmp, dest)
+	}
+
+	if err != nil {
+		return fmt.Errorf("pack asar: %w", err)
+	}
+
+	backup := tmp + ".previous"
+
+	err = os.Rename(dest, backup)
+	if err != nil {
+		return fmt.Errorf("pack asar: %w", err)
+	}
+
+	err = os.Rename(tmp, dest)
+	if err != nil {
+		_ = os.Rename(backup, dest)
+		return fmt.Errorf("pack asar: %w", err)
+	}
+
+	return removeSwapped(backup, tree)
+}
+
+func renamePath(tmp, dest string) error {
+	err := os.Rename(tmp, dest)
+	if err != nil {
+		return fmt.Errorf("pack asar: %w", err)
+	}
+
+	return nil
+}
+
+func removeSwapped(name string, tree bool) error {
+	if tree {
+		return removeTree(name)
+	}
+
+	err := os.Remove(name)
+	if err != nil {
+		return fmt.Errorf("pack asar: %w", err)
+	}
+
+	return nil
+}
+
+func removeTree(name string) error {
+	if name == "" {
+		return nil
+	}
+
+	err := os.RemoveAll(name)
+	if err != nil {
+		return fmt.Errorf("pack asar: %w", err)
+	}
+
+	return nil
 }
