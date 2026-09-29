@@ -1,4 +1,5 @@
 *~
 *.DS*
 coverage.out
+asar-test-*
 integration/node_modules

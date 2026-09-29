@@ -4,6 +4,7 @@ on:
     branches:
     - main
     - add-asar-reader
+    - test/electron-asar-integration
 permissions:
   contents: read
 jobs:

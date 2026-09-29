@@ -1,0 +1,565 @@
+package asar
+
+import (
+	"bytes"
+	"errors"
+	"io"
+	"os"
+	"path/filepath"
+	"runtime"
+	"testing"
+)
+
+func TestWriteArchiveRoundTrip(t *testing.T) {
+	t.Parallel()
+
+	var buf bytes.Buffer
+
+	err := WriteArchive(&buf, []Entry{
+		{Name: "dir/a.txt", Data: []byte("same")},
+		{Name: "b.txt", Data: []byte("same")},
+		{Name: "dir/nested.txt", Data: []byte("yes")},
+		{Name: "bin/tool", Data: []byte("run"), Executable: true},
+		{Name: "empty.txt", Data: []byte{}},
+		{Name: "link", Link: "dir/a.txt"},
+		{Name: "native.node", Data: []byte("unpacked-bytes"), Unpacked: true},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	reader := mustReader(t, buf.Bytes())
+	assertSharedFiles(t, reader, "dir/a.txt", "b.txt", "same")
+	assertPackedText(t, reader, "dir/nested.txt", "yes")
+	assertExecutableTool(t, fileByName(t, reader, "bin/tool"))
+	assertEmptyPacked(t, fileByName(t, reader, "empty.txt"))
+	assertLinkTarget(t, fileByName(t, reader, "link"), "dir/a.txt")
+	assertUnpackedOmitted(t, fileByName(t, reader, "native.node"), buf.Bytes())
+	assertParentDirs(t, reader)
+}
+
+func assertSharedFiles(t *testing.T, reader *Reader, leftName, rightName, text string) {
+	t.Helper()
+
+	left := fileByName(t, reader, leftName)
+	right := fileByName(t, reader, rightName)
+
+	if left.Offset != right.Offset || string(readPacked(t, left)) != text || string(readPacked(t, right)) != text {
+		t.Fatalf("shared files: %+v %+v", left, right)
+	}
+}
+
+func assertPackedText(t *testing.T, reader *Reader, name, text string) {
+	t.Helper()
+
+	if string(readPacked(t, fileByName(t, reader, name))) != text {
+		t.Fatalf("%s mismatch", name)
+	}
+}
+
+func assertExecutableTool(t *testing.T, tool *File) {
+	t.Helper()
+
+	if !tool.Executable || tool.Integrity == nil || tool.Integrity.Algorithm != "SHA256" {
+		t.Fatalf("tool = %+v", tool)
+	}
+}
+
+func assertEmptyPacked(t *testing.T, empty *File) {
+	t.Helper()
+
+	if !empty.Packed() || empty.Size != 0 || empty.Integrity == nil || empty.Integrity.Hash != hashOf(t, nil) {
+		t.Fatalf("empty = %+v", empty)
+	}
+}
+
+func assertLinkTarget(t *testing.T, link *File, target string) {
+	t.Helper()
+
+	if !link.IsLink() || link.Link != target {
+		t.Fatalf("link = %+v", link)
+	}
+}
+
+func assertUnpackedOmitted(t *testing.T, native *File, archive []byte) {
+	t.Helper()
+
+	if !native.Unpacked || native.Packed() || bytes.Contains(archive, []byte("unpacked-bytes")) {
+		t.Fatalf("unpacked entry was stored in the archive body: %+v", native)
+	}
+}
+
+func assertParentDirs(t *testing.T, reader *Reader) {
+	t.Helper()
+
+	if !fileByName(t, reader, "dir").IsDir() || !fileByName(t, reader, "bin").IsDir() {
+		t.Fatal("missing parent directories")
+	}
+}
+
+func TestWriteArchiveRejectsEscape(t *testing.T) {
+	t.Parallel()
+
+	err := WriteArchive(io.Discard, []Entry{{Name: "../outside", Data: []byte("x")}})
+	if !errors.Is(err, ErrInvalidHeader) {
+		t.Fatalf("name: %v", err)
+	}
+
+	err = WriteArchive(io.Discard, []Entry{{Name: "link", Link: "../outside"}})
+	if !errors.Is(err, ErrLinkOutside) {
+		t.Fatalf("link: %v", err)
+	}
+}
+
+func TestPackDirectory(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	src := filepath.Join(dir, "src")
+	writeDisk(t, filepath.Join(src, "dir", "a.txt"), "same", 0o644)
+	writeDisk(t, filepath.Join(src, "b.txt"), "same", 0o644)
+	writeDisk(t, filepath.Join(src, "bin", "tool.sh"), "#!/bin/sh\n", 0o755)
+	writeDisk(t, filepath.Join(src, "native", "addon.node"), "native", 0o644)
+
+	haveLink := true
+
+	err := os.Symlink(filepath.Join("..", "bin", "tool.sh"), filepath.Join(src, "dir", "alias"))
+	if err != nil {
+		if runtime.GOOS != "windows" {
+			t.Fatal(err)
+		}
+
+		haveLink = false
+	}
+
+	archive := filepath.Join(dir, "app.asar")
+
+	err = Pack(archive, src, Options{Unpack: func(name string) bool {
+		return name == "native/addon.node"
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	reader, err := Open(archive)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reader.Close()
+
+	assertSharedFiles(t, reader, "dir/a.txt", "b.txt", "same")
+	assertPackedExecutable(t, fileByName(t, reader, "bin/tool.sh"))
+	assertPackedSibling(t, archive, fileByName(t, reader, "native/addon.node"))
+	assertOptionalLink(t, reader, haveLink)
+}
+
+func assertPackedExecutable(t *testing.T, tool *File) {
+	t.Helper()
+
+	if runtime.GOOS != "windows" && !tool.Executable {
+		t.Fatalf("tool executable = %v", tool.Executable)
+	}
+}
+
+func assertPackedSibling(t *testing.T, archive string, native *File) {
+	t.Helper()
+
+	if !native.Unpacked || native.Integrity == nil {
+		t.Fatalf("addon = %+v", native)
+	}
+
+	body, err := os.ReadFile(filepath.Join(archive+".unpacked", "native", "addon.node"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if string(body) != "native" || native.Integrity.Hash != hashOf(t, body) {
+		t.Fatalf("sibling = %q integrity=%+v", body, native.Integrity)
+	}
+}
+
+func assertOptionalLink(t *testing.T, reader *Reader, haveLink bool) {
+	t.Helper()
+
+	if !haveLink {
+		return
+	}
+
+	assertLinkTarget(t, fileByName(t, reader, "dir/alias"), "bin/tool.sh")
+}
+
+func TestPackUnpackedExecutable(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	src := filepath.Join(dir, "src")
+	tool := filepath.Join(src, "bin", "tool.sh")
+	writeDisk(t, tool, "#!/bin/sh\n", 0o755)
+
+	archive := filepath.Join(dir, "app.asar")
+
+	err := Pack(archive, src, Options{Unpack: func(name string) bool {
+		return name == "bin/tool.sh"
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	sourceInfo, err := os.Stat(tool)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	copied, err := os.Stat(filepath.Join(archive+".unpacked", "bin", "tool.sh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if runtime.GOOS != "windows" && copied.Mode().Perm() != sourceInfo.Mode().Perm() {
+		t.Fatalf("unpacked mode = %o, source = %o", copied.Mode().Perm(), sourceInfo.Mode().Perm())
+	}
+}
+
+func TestPackSymlinkedSource(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	src := filepath.Join(dir, "src")
+	writeDisk(t, filepath.Join(src, "file.txt"), "data", 0o644)
+
+	alias := filepath.Join(dir, "alias")
+
+	err := os.Symlink(src, alias)
+	if err != nil {
+		if runtime.GOOS == "windows" {
+			t.Skip("symlinks are not available")
+		}
+
+		t.Fatal(err)
+	}
+
+	archive := filepath.Join(dir, "app.asar")
+
+	err = Pack(archive, alias, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	reader, err := Open(archive)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reader.Close()
+
+	assertPackedText(t, reader, "file.txt", "data")
+}
+
+func TestUnpackedSiblingKeepsZeroMode(t *testing.T) {
+	t.Parallel()
+
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX permissions")
+	}
+
+	dir := t.TempDir()
+	dest := filepath.Join(dir, "native", "addon.node")
+
+	err := writeNew(dest, bytes.NewReader([]byte("native")), 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	info, err := os.Stat(dest)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if info.Mode().Perm() != 0 {
+		t.Fatalf("unpacked mode = %o", info.Mode().Perm())
+	}
+}
+
+func TestPackAbsoluteLinkWithRelativeSource(t *testing.T) {
+	t.Parallel()
+
+	dir := relTempDir(t)
+	src := filepath.Join(dir, "src")
+	writeDisk(t, filepath.Join(src, "bin", "tool.sh"), "#!/bin/sh\n", 0o755)
+
+	absSrc, err := filepath.Abs(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = os.Symlink(filepath.Join(absSrc, "bin", "tool.sh"), filepath.Join(src, "alias"))
+	if err != nil {
+		if runtime.GOOS == "windows" {
+			t.Skip("symlinks are not available")
+		}
+
+		t.Fatal(err)
+	}
+
+	archive := filepath.Join(dir, "app.asar")
+
+	err = Pack(archive, src, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	reader, err := Open(archive)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reader.Close()
+
+	assertLinkTarget(t, fileByName(t, reader, "alias"), "bin/tool.sh")
+}
+
+func TestPackRejectsOutputInsideSource(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	src := filepath.Join(dir, "src")
+	writeDisk(t, filepath.Join(src, "file.txt"), "data", 0o644)
+
+	err := Pack(filepath.Join(src, "app.asar"), src, Options{})
+	if !errors.Is(err, ErrOutputInside) {
+		t.Fatalf("in-tree output: %v", err)
+	}
+
+	outside := filepath.Join(dir, "outside.txt")
+	writeDisk(t, outside, "safe", 0o644)
+
+	err = os.Symlink(outside, filepath.Join(src, "app.asar"))
+	if err != nil {
+		if runtime.GOOS == "windows" {
+			t.Skip("symlinks are not available")
+		}
+
+		t.Fatal(err)
+	}
+
+	err = Pack(filepath.Join(src, "app.asar"), src, Options{})
+	if !errors.Is(err, ErrOutputInside) {
+		t.Fatalf("symlinked output: %v", err)
+	}
+
+	body, err := os.ReadFile(outside)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if string(body) != "safe" {
+		t.Fatalf("outside file = %q", body)
+	}
+
+	alias := filepath.Join(dir, "alias")
+
+	err = os.Symlink(src, alias)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = Pack(filepath.Join(src, "nested.asar"), alias, Options{})
+	if !errors.Is(err, ErrOutputInside) {
+		t.Fatalf("aliased source: %v", err)
+	}
+}
+
+func TestPackReplacesUnpackedTree(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	src := filepath.Join(dir, "src")
+	writeDisk(t, filepath.Join(src, "native", "addon.node"), "native", 0o644)
+	writeDisk(t, filepath.Join(src, "other.node"), "other", 0o644)
+
+	archive := filepath.Join(dir, "app.asar")
+
+	err := Pack(archive, src, Options{Unpack: func(name string) bool {
+		return name == "native/addon.node"
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	writeDisk(t, filepath.Join(archive+".unpacked", "stale.txt"), "stale", 0o644)
+
+	err = Pack(archive, src, Options{Unpack: func(name string) bool {
+		return name == "other.node"
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = os.Stat(filepath.Join(archive+".unpacked", "native", "addon.node"))
+	if !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("previous sibling: %v", err)
+	}
+
+	_, err = os.Stat(filepath.Join(archive+".unpacked", "stale.txt"))
+	if !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("stale sibling: %v", err)
+	}
+
+	body, err := os.ReadFile(filepath.Join(archive+".unpacked", "other.node"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if string(body) != "other" {
+		t.Fatalf("replacement sibling = %q", body)
+	}
+}
+
+func TestPackLeavesOutputWhenWalkFails(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	src := filepath.Join(dir, "src")
+	writeDisk(t, filepath.Join(src, "file.txt"), "keep", 0o644)
+
+	archive := filepath.Join(dir, "app.asar")
+	mustPackUnpacked(t, archive, src)
+
+	sibling := filepath.Join(archive+".unpacked", "file.txt")
+	before := readDisk(t, archive)
+	beforeSibling := readDisk(t, sibling)
+	linkOutsideOrSkip(t, src)
+
+	err := Pack(archive, src, Options{Unpack: func(string) bool { return true }})
+	if !errors.Is(err, ErrLinkOutside) {
+		t.Fatalf("got %v", err)
+	}
+
+	if !bytes.Equal(before, readDisk(t, archive)) || !bytes.Equal(beforeSibling, readDisk(t, sibling)) {
+		t.Fatal("failed pack changed the previous output")
+	}
+}
+
+func relTempDir(t *testing.T) string {
+	t.Helper()
+
+	// t.TempDir can live on another volume, which cannot be named relative to the module.
+	dir, err := os.MkdirTemp(".", "asar-test-") //nolint:usetesting
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	t.Cleanup(func() {
+		_ = os.RemoveAll(dir)
+	})
+
+	return dir
+}
+
+func mustPackUnpacked(t *testing.T, archive, src string) {
+	t.Helper()
+
+	err := Pack(archive, src, Options{Unpack: func(string) bool { return true }})
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func readDisk(t *testing.T, path string) []byte {
+	t.Helper()
+
+	body, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	return body
+}
+
+func linkOutsideOrSkip(t *testing.T, src string) {
+	t.Helper()
+
+	err := os.Symlink(filepath.Join("..", "outside"), filepath.Join(src, "bad"))
+	if err != nil {
+		if runtime.GOOS == "windows" {
+			t.Skip("symlinks are not available")
+		}
+
+		t.Fatal(err)
+	}
+}
+
+type shortWriter struct{}
+
+func (shortWriter) Write(data []byte) (int, error) {
+	if len(data) == 0 {
+		return 0, nil
+	}
+
+	return len(data) - 1, nil
+}
+
+func TestWriteArchiveRejectsShortWrite(t *testing.T) {
+	t.Parallel()
+
+	err := WriteArchive(shortWriter{}, []Entry{{Name: "a.txt", Data: []byte("hello")}})
+	if !errors.Is(err, io.ErrShortWrite) {
+		t.Fatalf("got %v", err)
+	}
+}
+
+func TestPackRejectsLinkOutside(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	src := filepath.Join(dir, "src")
+	writeDisk(t, filepath.Join(src, "keep.txt"), "x", 0o644)
+
+	err := os.Symlink(filepath.Join("..", "outside"), filepath.Join(src, "bad"))
+	if err != nil {
+		if runtime.GOOS == "windows" {
+			t.Skip("symlinks are not available")
+		}
+
+		t.Fatal(err)
+	}
+
+	err = Pack(filepath.Join(dir, "app.asar"), src, Options{})
+	if !errors.Is(err, ErrLinkOutside) {
+		t.Fatalf("got %v", err)
+	}
+}
+
+func readPacked(t *testing.T, file *File) []byte {
+	t.Helper()
+
+	body, err := io.ReadAll(mustOpen(t, file))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	return body
+}
+
+func writeDisk(t *testing.T, path, body string, mode os.FileMode) {
+	t.Helper()
+
+	err := os.MkdirAll(filepath.Dir(path), 0o750)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = os.WriteFile(path, []byte(body), mode)
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func hashOf(t *testing.T, body []byte) string {
+	t.Helper()
+
+	sum, _, err := integrityReader(bytes.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	return sum.Hash
+}

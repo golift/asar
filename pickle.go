@@ -108,3 +108,33 @@ func readPickleString(payload []byte) (string, error) {
 
 	return string(text), nil
 }
+
+// encodeSizePickle returns the 8-byte pickle that stores the header pickle length.
+func encodeSizePickle(headerLen int) ([]byte, error) {
+	if headerLen < pickleHeaderSize || uint64(headerLen) > maxHeaderPickle {
+		return nil, fmt.Errorf("%w: %d bytes", ErrHeaderTooLarge, headerLen)
+	}
+
+	buf := make([]byte, sizePickleBytes)
+	binary.LittleEndian.PutUint32(buf[0:4], pickleHeaderSize)
+	binary.LittleEndian.PutUint32(buf[4:8], uint32(headerLen))
+
+	return buf, nil
+}
+
+// encodeStringPickle returns a pickle whose payload is one string.
+func encodeStringPickle(text string) ([]byte, error) {
+	strLen := len(text)
+	payload := pickleHeaderSize + alignPickle(strLen)
+
+	if payload < 0 || uint64(payload) > maxHeaderPickle {
+		return nil, fmt.Errorf("%w: string pickle is %d bytes", ErrHeaderTooLarge, payload)
+	}
+
+	buf := make([]byte, pickleHeaderSize+payload)
+	binary.LittleEndian.PutUint32(buf[0:4], uint32(payload))
+	binary.LittleEndian.PutUint32(buf[4:8], uint32(strLen))
+	copy(buf[pickleHeaderSize*2:], text)
+
+	return buf, nil
+}
