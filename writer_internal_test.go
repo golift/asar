@@ -223,11 +223,16 @@ func TestPackUnpackedExecutable(t *testing.T) {
 func TestPackAbsoluteLinkWithRelativeSource(t *testing.T) {
 	t.Parallel()
 
-	dir := t.TempDir()
+	dir := relTempDir(t)
 	src := filepath.Join(dir, "src")
 	writeDisk(t, filepath.Join(src, "bin", "tool.sh"), "#!/bin/sh\n", 0o755)
 
-	err := os.Symlink(filepath.Join(src, "bin", "tool.sh"), filepath.Join(src, "alias"))
+	absSrc, err := filepath.Abs(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = os.Symlink(filepath.Join(absSrc, "bin", "tool.sh"), filepath.Join(src, "alias"))
 	if err != nil {
 		if runtime.GOOS == "windows" {
 			t.Skip("symlinks are not available")
@@ -236,23 +241,9 @@ func TestPackAbsoluteLinkWithRelativeSource(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	cwd, err := os.Getwd()
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	rel, err := filepath.Rel(cwd, src)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	if filepath.IsAbs(rel) {
-		t.Skip("source is on another volume")
-	}
-
 	archive := filepath.Join(dir, "app.asar")
 
-	err = Pack(archive, rel, Options{})
+	err = Pack(archive, src, Options{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -386,6 +377,22 @@ func TestPackLeavesOutputWhenWalkFails(t *testing.T) {
 	if !bytes.Equal(before, readDisk(t, archive)) || !bytes.Equal(beforeSibling, readDisk(t, sibling)) {
 		t.Fatal("failed pack changed the previous output")
 	}
+}
+
+func relTempDir(t *testing.T) string {
+	t.Helper()
+
+	// t.TempDir can live on another volume, which cannot be named relative to the module.
+	dir, err := os.MkdirTemp(".", "asar-test-") //nolint:usetesting
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	t.Cleanup(func() {
+		_ = os.RemoveAll(dir)
+	})
+
+	return dir
 }
 
 func mustPackUnpacked(t *testing.T, archive, src string) {
