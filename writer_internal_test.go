@@ -220,6 +220,65 @@ func TestPackUnpackedExecutable(t *testing.T) {
 	}
 }
 
+func TestPackSymlinkedSource(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	src := filepath.Join(dir, "src")
+	writeDisk(t, filepath.Join(src, "file.txt"), "data", 0o644)
+
+	alias := filepath.Join(dir, "alias")
+
+	err := os.Symlink(src, alias)
+	if err != nil {
+		if runtime.GOOS == "windows" {
+			t.Skip("symlinks are not available")
+		}
+
+		t.Fatal(err)
+	}
+
+	archive := filepath.Join(dir, "app.asar")
+
+	err = Pack(archive, alias, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	reader, err := Open(archive)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reader.Close()
+
+	assertPackedText(t, reader, "file.txt", "data")
+}
+
+func TestUnpackedSiblingKeepsZeroMode(t *testing.T) {
+	t.Parallel()
+
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX permissions")
+	}
+
+	dir := t.TempDir()
+	dest := filepath.Join(dir, "native", "addon.node")
+
+	err := writeNew(dest, bytes.NewReader([]byte("native")), 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	info, err := os.Stat(dest)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if info.Mode().Perm() != 0 {
+		t.Fatalf("unpacked mode = %o", info.Mode().Perm())
+	}
+}
+
 func TestPackAbsoluteLinkWithRelativeSource(t *testing.T) {
 	t.Parallel()
 

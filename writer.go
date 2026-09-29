@@ -69,8 +69,9 @@ func WriteArchive(writer io.Writer, entries []Entry) error {
 // Pack writes the directory src to dest as an ASAR archive.
 // Symlinks become package-relative links and must stay inside src.
 // Unpacked files are copied to dest+".unpacked".
-// dest must not be inside src. A previous archive is replaced only after the
-// new archive and sibling tree have both been written.
+// dest must not be inside src. A symlink to a directory is packed as that
+// directory. A previous archive is replaced only after the new archive and
+// sibling tree have both been installed.
 func Pack(dest, src string, opts Options) error {
 	info, err := os.Stat(src)
 	if err != nil {
@@ -81,14 +82,20 @@ func Pack(dest, src string, opts Options) error {
 		return fmt.Errorf("%w: %s is not a directory", ErrInvalidHeader, src)
 	}
 
-	err = rejectOutputInsideSource(dest, src)
+	// WalkDir does not descend through a symlink used as its root.
+	root, err := resolveDir(src)
+	if err != nil {
+		return err
+	}
+
+	err = rejectOutputInsideSource(dest, root)
 	if err != nil {
 		return err
 	}
 
 	builder := newBuilder(opts)
 
-	err = builder.addTree(src)
+	err = builder.addTree(root)
 	if err != nil {
 		return err
 	}
@@ -298,7 +305,7 @@ func (b *builder) addContent(name string, source bodySource, mode os.FileMode, u
 	node.unpacked = unpacked
 
 	if unpacked {
-		b.siblings = append(b.siblings, siblingFile{name: name, mode: siblingMode(mode), source: source})
+		b.siblings = append(b.siblings, siblingFile{name: name, mode: mode.Perm(), source: source})
 		return nil
 	}
 
@@ -418,21 +425,7 @@ func (b *builder) publish(dest string) error {
 		return err
 	}
 
-	err = installFile(archiveName, dest)
-	if err != nil {
-		_ = os.Remove(archiveName)
-		_ = removeTree(unpackedName)
-
-		return err
-	}
-
-	err = installUnpacked(unpackedName, dest+".unpacked")
-	if err != nil {
-		_ = removeTree(unpackedName)
-		return err
-	}
-
-	return nil
+	return commitOutputs(dest, archiveName, unpackedName)
 }
 
 func (b *builder) stageArchive(dir string) (string, error) {
@@ -791,15 +784,6 @@ func entryMode(executable bool) os.FileMode {
 	return archiveFileMode
 }
 
-func siblingMode(mode os.FileMode) os.FileMode {
-	mode = mode.Perm()
-	if mode == 0 {
-		return archiveFileMode
-	}
-
-	return mode
-}
-
 func writeFull(out io.Writer, data []byte) error {
 	n, err := out.Write(data)
 	if err != nil {
@@ -908,59 +892,129 @@ func outsideRel(rel string) bool {
 	return rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator))
 }
 
-func installFile(tmp, dest string) error {
-	return swapPath(tmp, dest, false)
-}
+func commitOutputs(dest, archiveTmp, unpackedTmp string) error {
+	unpackedDest := dest + ".unpacked"
 
-func installUnpacked(tmp, dest string) error {
-	if tmp == "" {
-		return removeTree(dest)
+	archiveBak, err := moveAside(dest)
+	if err != nil {
+		discardStaged(archiveTmp, unpackedTmp)
+		return err
 	}
 
-	return swapPath(tmp, dest, true)
+	unpackedBak, err := moveAside(unpackedDest)
+	if err != nil {
+		restoreAside(archiveBak, dest)
+		discardStaged(archiveTmp, unpackedTmp)
+
+		return err
+	}
+
+	err = renamePath(archiveTmp, dest)
+	if err != nil {
+		restorePair(dest, unpackedDest, archiveBak, unpackedBak)
+		discardStaged(archiveTmp, unpackedTmp)
+
+		return err
+	}
+
+	err = placeUnpacked(unpackedTmp, unpackedDest)
+	if err != nil {
+		displaceNewArchive(dest)
+		restorePair(dest, unpackedDest, archiveBak, unpackedBak)
+		discardStaged("", unpackedTmp)
+
+		return err
+	}
+
+	return removeBackups(archiveBak, unpackedBak)
 }
 
-func swapPath(tmp, dest string, tree bool) error {
-	_, err := os.Lstat(dest)
+func moveAside(name string) (string, error) {
+	_, err := os.Lstat(name)
 	if errors.Is(err, os.ErrNotExist) {
-		return renamePath(tmp, dest)
+		return "", nil
 	}
 
 	if err != nil {
-		return fmt.Errorf("pack asar: %w", err)
+		return "", fmt.Errorf("pack asar: %w", err)
 	}
 
-	backup := tmp + ".previous"
+	dir := filepath.Dir(name)
 
-	err = os.Rename(dest, backup)
+	file, err := os.CreateTemp(dir, ".asar-previous-*")
 	if err != nil {
-		return fmt.Errorf("pack asar: %w", err)
+		return "", fmt.Errorf("pack asar: %w", err)
 	}
 
-	err = os.Rename(tmp, dest)
+	backup := file.Name()
+	closeErr := file.Close()
+	removeErr := os.Remove(backup)
+
+	if closeErr != nil || removeErr != nil {
+		return "", fmt.Errorf("pack asar: %w", errors.Join(closeErr, removeErr))
+	}
+
+	err = os.Rename(name, backup)
 	if err != nil {
-		_ = os.Rename(backup, dest)
-		return fmt.Errorf("pack asar: %w", err)
+		return "", fmt.Errorf("pack asar: %w", err)
 	}
 
-	return removeSwapped(backup, tree)
+	return backup, nil
+}
+
+func placeUnpacked(tmp, dest string) error {
+	if tmp == "" {
+		return nil
+	}
+
+	return renamePath(tmp, dest)
+}
+
+func restorePair(dest, unpackedDest, archiveBak, unpackedBak string) {
+	restoreAside(archiveBak, dest)
+	restoreAside(unpackedBak, unpackedDest)
+}
+
+func restoreAside(backup, dest string) {
+	if backup == "" {
+		return
+	}
+
+	_ = os.Rename(backup, dest)
+}
+
+func displaceNewArchive(dest string) {
+	_ = os.Remove(dest)
+}
+
+func discardStaged(archiveTmp, unpackedTmp string) {
+	if archiveTmp != "" {
+		_ = os.Remove(archiveTmp)
+	}
+
+	_ = removeTree(unpackedTmp)
+}
+
+func removeBackups(archiveBak, unpackedBak string) error {
+	err := removeTree(unpackedBak)
+	if archiveBak == "" {
+		return err
+	}
+
+	fileErr := os.Remove(archiveBak)
+	if fileErr != nil {
+		fileErr = fmt.Errorf("pack asar: %w", fileErr)
+	}
+
+	if err != nil {
+		return err
+	}
+
+	return fileErr
 }
 
 func renamePath(tmp, dest string) error {
 	err := os.Rename(tmp, dest)
-	if err != nil {
-		return fmt.Errorf("pack asar: %w", err)
-	}
-
-	return nil
-}
-
-func removeSwapped(name string, tree bool) error {
-	if tree {
-		return removeTree(name)
-	}
-
-	err := os.Remove(name)
 	if err != nil {
 		return fmt.Errorf("pack asar: %w", err)
 	}
